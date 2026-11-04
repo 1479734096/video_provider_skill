@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -19,8 +20,9 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib import error, parse, request
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 TESTED_YTDLP_VERSION = "2026.10.26"
+REMOTE_CLIP_PROFILE = "h264-aac-v2"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
 
 
@@ -208,8 +210,11 @@ class Provider:
 
     def run(self, command: list[str], *, warnings: bool = False) -> str:
         process = None
+        # 单文件下载器会在 TEMP 解包运行库，强制终止后也由本次调用统一回收。
+        temporary = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="tool-", dir=self.temporary)))
+        env = self.env | {"TEMP": str(temporary), "TMP": str(temporary), "TMPDIR": str(temporary)}
         try:
-            process = subprocess.Popen(command, cwd=self.cache, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, start_new_session=os.name != "nt")
+            process = subprocess.Popen(command, cwd=self.cache, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, start_new_session=os.name != "nt")
             stdout, stderr = process.communicate(timeout=self.args.timeout)
         except subprocess.TimeoutExpired:
             detail = self.stop_process_tree(process) if process else ""
@@ -336,7 +341,7 @@ class Provider:
             raise ProviderError("INVALID_MEDIA", "媒体时间或帧率信息无效") from None
         if not math.isfinite(duration) or duration <= 0 or (require_video and (not video or not video.get("width") or not video.get("height"))) or (not require_video and not audios):
             raise ProviderError("INVALID_MEDIA", "媒体没有有效视频轨道、尺寸或正时长")
-        return {"duration": duration, "width": video.get("width"), "height": video.get("height"), "video_codec": video.get("codec_name"), "pixel_format": video.get("pix_fmt"), "fps": fps, "has_audio": bool(audios), "audio_codecs": [stream.get("codec_name") for stream in audios], "container": data.get("format", {}).get("format_name"), "size_bytes": path.stat().st_size}
+        return {"duration": duration, "width": video.get("width"), "height": video.get("height"), "video_codec": video.get("codec_name"), "pixel_format": video.get("pix_fmt"), "color_range": video.get("color_range"), "fps": fps, "has_audio": bool(audios), "audio_codecs": [stream.get("codec_name") for stream in audios], "container": data.get("format", {}).get("format_name"), "size_bytes": path.stat().st_size}
 
     def describe(self, value: str, *, subtitles: bool = True) -> dict:
         path = Path(value).expanduser()
@@ -394,19 +399,15 @@ class Provider:
         return {"status": "inspected", "source": description["source"], "duration": description["duration_ms"] / 1000, "pages": description["pages"], "formats": description["formats"], "selected_formats": description["selected_formats"], "media": description.get("media"), "subtitles": [{key: track[key] for key in ("language", "source", "automatic")} for track in description["tracks"]], "warnings": self.warnings}
 
     def interval(self, description: dict) -> tuple[int, int, dict]:
-        start = milliseconds(self.args.start)
-        duration = milliseconds(self.args.duration if self.args.duration is not None else 120)
-        if duration <= 0:
-            raise ProviderError("INVALID_TIME", "片段时长必须大于零")
-        if self.args.full and (start or self.args.duration is not None):
-            raise ProviderError("INVALID_ARGUMENT", "--full 不能与非零 --start 或 --duration 同时使用")
+        start = self.args.start_ms
+        duration = self.args.duration_ms if self.args.duration_ms is not None else 120_000
         total = description["duration_ms"]
         if start >= total:
             raise ProviderError("RANGE_OUT_OF_BOUNDS", f"起点 {seconds(start)} 秒已达到或超过视频时长 {seconds(total)} 秒")
         requested_end = total if self.args.full else start + duration
         return start, min(requested_end, total), {"start_ms": start, "end_ms": requested_end, "full": self.args.full}
 
-    def valid_cached(self, path: Path, expected: int, require_audio: bool = False, *, require_video: bool = True) -> dict | None:
+    def valid_cached(self, path: Path, expected: int, require_audio: bool = False, *, require_video: bool = True, compatible: bool = False) -> dict | None:
         if not path.is_file() or not path.stat().st_size:
             return None
         try:
@@ -416,12 +417,23 @@ class Provider:
         tolerance = max(0.5, 2 / (media["fps"] or 25))
         if abs(media["duration"] - expected / 1000) > tolerance or (require_audio and not media["has_audio"]):
             return None
+        if compatible:
+            # yuvj420p 是全范围 8 位 4:2:0 的旧名称，不应当作不兼容的像素格式。
+            if media["video_codec"] != "h264" or media["pixel_format"] not in ("yuv420p", "yuvj420p") or "mp4" not in (media["container"] or "").split(","):
+                return None
+            if media["width"] % 2 or media["height"] % 2 or any(codec != "aac" for codec in media["audio_codecs"]):
+                return None
+            if self.args.max_height and media["height"] > self.args.max_height:
+                return None
         return media
 
-    def convert(self, source: Path, output: Path, start: int, duration: int, *, height: int | None = None) -> None:
-        command = [self.tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-ss", seconds(start), "-i", str(source), "-t", seconds(duration), "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn", "-map_metadata", "-1", "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+    def encoding_args(self, height: int | None) -> list[str]:
         scale = f"scale=-2:'trunc(min(ih,{height})/2)*2'" if height else "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-        command += ["-vf", scale, str(output)]
+        return ["-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1", "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-vf", scale]
+
+    def convert(self, source: Path, output: Path, start: int, duration: int, *, height: int | None = None) -> None:
+        command = [self.tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-ss", seconds(start), "-i", str(source), "-t", seconds(duration), "-map", "0:v:0", "-map", "0:a?"]
+        command += self.encoding_args(height) + [str(output)]
         self.run(command)
 
     def subtitles(self, description: dict, start: int, end: int, directory: Path) -> list[dict]:
@@ -468,12 +480,15 @@ class Provider:
         part = component(source.get("cid") or source["id"])
         format_directory = self.cache / "media" / source["kind"] / identity / part / component(format_id)
         full_name = f"full-h{self.args.max_height}" if source["kind"] == "local" and self.args.max_height else "full"
-        directory = format_directory / (full_name if self.args.full else f"{start}-{end}-h{self.args.max_height or 'source'}-h264-aac-v1")
+        profile = "h264-aac-v1" if source["kind"] == "local" else REMOTE_CLIP_PROFILE
+        directory = format_directory / (full_name if self.args.full else f"{start}-{end}-h{self.args.max_height or 'source'}-{profile}")
         directory.mkdir(parents=True, exist_ok=True)
         existing = load_json(directory / "result.json")
         require_audio = any(fmt.get("acodec") not in (None, "none") for fmt in description["selected_formats"]) if source["kind"] != "local" else description["media"]["has_audio"]
         video = Path(existing["video_path"]) if existing and existing.get("video_path") else directory / "video.mp4"
-        media = self.valid_cached(video, end - start, require_audio) if existing else None
+        resize_full = self.args.full and source["kind"] == "local" and self.args.max_height and description["media"]["height"] > self.args.max_height
+        compatible = not self.args.full or bool(resize_full)
+        media = self.valid_cached(video, end - start, require_audio, compatible=compatible) if existing else None
         cached = media is not None
         acquisition = "cached_output" if cached else "local_file"
         transformations = existing.get("transformations", []) if cached else []
@@ -489,10 +504,15 @@ class Provider:
                         acquisition = "cached_full_source"
                 if input_path is None:
                     acquisition = "downloaded_full" if self.args.full else "downloaded_range"
-                    command = self.ytdlp() + ["--quiet", "--no-simulate", "-f", format_id, "--ffmpeg-location", str(Path(self.tool("ffmpeg")).parent), "--merge-output-format", "mkv", "-o", str(work / "source.%(ext)s"), "--print", "after_move:%(filepath)j"]
+                    # 当次元信息含短期播放地址，仅放在临时目录，交给下载器复用并处理失效回退。
+                    info_path = work / "source.info.json"
+                    info_path.write_text(json.dumps(description["info"], ensure_ascii=False), encoding="utf-8")
+                    command = self.ytdlp() + ["--quiet", "--no-simulate", "-f", format_id, "--ffmpeg-location", str(Path(self.tool("ffmpeg")).parent), "--merge-output-format", "mkv" if self.args.full else "mp4", "-o", str(work / "source.%(ext)s"), "--print", "after_move:%(filepath)j"]
                     if not self.args.full:
                         command += ["--download-sections", f"*{seconds(start)}-{seconds(end)}", "--force-keyframes-at-cuts"]
-                    output = self.run(command + ["--", source["url"]], warnings=True)
+                        output_args = self.encoding_args(self.args.max_height) + ["-t", seconds(end - start), "-f", "mp4"]
+                        command += ["--downloader-args", "ffmpeg_o:" + shlex.join(output_args)]
+                    output = self.run(command + ["--load-info-json", str(info_path)], warnings=True)
                     paths = []
                     for line in output.splitlines():
                         try:
@@ -503,28 +523,36 @@ class Provider:
                             continue
                     if len(paths) != 1:
                         raise ProviderError("DOWNLOAD_OUTPUT_MISSING", "下载器未返回唯一的已完成媒体文件")
-                    input_path = paths[0]
+                    input_path = paths[0].resolve()
+                    if not input_path.is_relative_to(work.resolve()):
+                        raise ProviderError("DOWNLOAD_OUTPUT_INVALID", "下载结果不在本次临时目录中")
                     input_start = 0
-                if self.args.full and source["kind"] == "local" and self.args.max_height and description["media"]["height"] > self.args.max_height:
+                if resize_full:
                     staged = work / "complete.mp4"
                     self.convert(input_path, staged, 0, end, height=self.args.max_height)
                     video = directory / "video.mp4"
                     transformations = [f"按显式高度限制对完整视频转码，输出高度不超过 {self.args.max_height}"]
                 elif self.args.full:
-                    staged = work / ("complete" + input_path.suffix.lower())
-                    shutil.copyfile(input_path, staged)
+                    staged = input_path
+                    if source["kind"] == "local":
+                        staged = work / ("complete" + input_path.suffix.lower())
+                        shutil.copyfile(input_path, staged)
                     video = directory / ("video" + staged.suffix)
                     transformations = ["完整文件保留来源编码"]
                 else:
-                    staged = work / "clip.mp4"
-                    self.convert(input_path, staged, input_start, end - start, height=self.args.max_height)
+                    staged = input_path
+                    if acquisition != "downloaded_range":
+                        staged = work / "clip.mp4"
+                        self.convert(input_path, staged, input_start, end - start, height=self.args.max_height)
                     video = directory / "video.mp4"
-                    transformations = ["按请求时间区间裁剪", "H.264/yuv420p 视频与 AAC 音轨，清除来源描述元数据"]
+                    transformations = ["按请求时间区间裁剪", "H.264/8 位 4:2:0 视频与 AAC 音轨，清除来源描述元数据"]
+                    if acquisition == "downloaded_range":
+                        transformations.append("区间下载与兼容编码在同一轮 FFmpeg 完成")
                     if self.args.max_height:
                         transformations.append(f"输出高度不超过 {self.args.max_height}，不放大来源")
-                media = self.valid_cached(staged, end - start, require_audio)
+                media = self.valid_cached(staged, end - start, require_audio, compatible=compatible)
                 if media is None:
-                    raise ProviderError("INVALID_MEDIA", "输出没有所需音视频轨道，或时长与实际请求区间不符")
+                    raise ProviderError("INVALID_MEDIA", "输出轨道、时长、编码或尺寸不符合请求")
                 os.replace(staged, video)
         audio_path = None
         audio_media = None
@@ -560,8 +588,8 @@ class Provider:
         if not path.is_file():
             raise ProviderError("LOCAL_FILE_REQUIRED", "frames 只接收已存在的本地视频文件")
         description = self.describe(str(path))
-        start = milliseconds(self.args.start)
-        end = description["duration_ms"] if self.args.duration is None else min(description["duration_ms"], start + milliseconds(self.args.duration))
+        start = self.args.start_ms
+        end = description["duration_ms"] if self.args.duration_ms is None else min(description["duration_ms"], start + self.args.duration_ms)
         if start >= end:
             raise ProviderError("RANGE_OUT_OF_BOUNDS", "采样区间必须位于视频内并具有正时长")
         count = min(self.args.count, max(1, math.ceil((end - start) / 1000 * (description["media"]["fps"] or 25))))
@@ -635,6 +663,15 @@ def main() -> int:
         height = getattr(args, "max_height", None)
         if not math.isfinite(args.timeout) or args.timeout <= 0 or (height is not None and height < 2) or (args.command == "frames" and args.count < 1):
             raise ProviderError("INVALID_ARGUMENT", "超时、采样数量必须为正数，最大高度至少为 2")
+        if getattr(args, "page", None) is not None and args.page < 1:
+            raise ProviderError("INVALID_PAGE", "分 P 必须从 1 开始")
+        if args.command in ("fetch", "frames"):
+            args.start_ms = milliseconds(args.start)
+            args.duration_ms = milliseconds(args.duration) if args.duration is not None else None
+            if args.duration_ms is not None and args.duration_ms <= 0:
+                raise ProviderError("INVALID_TIME", "片段时长必须大于零")
+            if args.command == "fetch" and args.full and (args.start_ms or args.duration_ms is not None):
+                raise ProviderError("INVALID_ARGUMENT", "--full 不能与非零 --start 或 --duration 同时使用")
         provider = Provider(args)
         result = getattr(provider, args.command)()
         print(json.dumps(result, ensure_ascii=False, indent=2))
